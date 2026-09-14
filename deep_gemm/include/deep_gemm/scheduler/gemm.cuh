@@ -35,12 +35,28 @@ template <GemmType kGemmType,
           bool kEnsureZeroPadding = true,
           uint32_t kKAlignment = 128u,     // psum k-group start alignment
           uint32_t kSFKSpan = 128u,        // K covered by one k-grouped SF row
-          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
+          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(),
+          uint32_t kSplitKFactor = 1>
 struct Scheduler {
     // A/B group starts must be aligned to whole K blocks. SF rows are packed
     // independently per group and tracked by `current_sf_k_cumsum`.
     DG_STATIC_ASSERT(not is_k_grouped_contiguous(kGemmType) or kKAlignment % 128 == 0,
                      "K alignment must be a multiple of BLOCK_K (128)");
+
+    // Only `Normal` has both halves of split-K: the constructor inflates `num_blocks` by
+    // `kSplitKFactor`, and `get_next_block`'s final `else` decomposes the raw index back into
+    // `mn_block_idx` / `split_k_idx`. Every other `GemmType` has at most one half:
+    //   - `Batched` is inflated but its own branch never sets `split_k_idx`, and it derives
+    //     `current_group_idx` from the inflated `num_blocks` -- wrong group indexing;
+    //   - `MGroupedContiguous` falls into the same final `else` as `Normal` but is NOT
+    //     inflated, so `split_k_idx` is always 0 -- every block writes partition 0 and
+    //     partitions 1..n-1 keep the uninitialised workspace `sm120_split_k_reduce` sums.
+    // Both are silent wrong numerics, so encode the invariant rather than the two symptoms.
+    // The `Batched` defect also exists upstream in nv_dev; we deliberately do not fix it here.
+    DG_STATIC_ASSERT(kSplitKFactor == 1 or kGemmType == GemmType::Normal,
+                     "Split-K is only supported for Normal GEMM: it is the only GemmType whose "
+                     "constructor inflates num_blocks by kSplitKFactor AND whose get_next_block "
+                     "branch decomposes the index into mn_block_idx/split_k_idx");
 
     int current_iter = -1;
 
@@ -48,6 +64,10 @@ struct Scheduler {
     uint32_t num_blocks;
     uint32_t num_m_blocks;
     uint32_t num_n_blocks;
+
+    // Split-K state (inert unless kSplitKFactor > 1)
+    uint32_t num_mn_blocks;
+    uint32_t split_k_idx;
 
     // For SM90 multicast checks
     uint32_t num_blocks_in_group;
@@ -87,8 +107,9 @@ struct Scheduler {
         num_m_blocks = math::ceil_div(shape_m, BLOCK_M);
         num_n_blocks = math::ceil_div(shape_n, BLOCK_N);
         current_shape_k = is_k_grouped_contiguous(kGemmType) ? 0 : shape_k;
+        num_mn_blocks = num_m_blocks * num_n_blocks;
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched) {
-            num_blocks = num_m_blocks * num_n_blocks;
+            num_blocks = num_mn_blocks * kSplitKFactor;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
@@ -258,15 +279,25 @@ struct Scheduler {
                 n_block_idx = block_idx / num_m_blocks;
             }
         } else {
+            // NOTES: the bounds check stays on the RAW index against the inflated
+            // `num_blocks`, or split-K never terminates.
             if (next_block_idx >= num_blocks)
                 return false;
+
+            uint32_t mn_block_idx = next_block_idx;
+            if constexpr (kSplitKFactor > 1) {
+                mn_block_idx = next_block_idx % num_mn_blocks;
+                split_k_idx  = next_block_idx / num_mn_blocks;
+            } else {
+                split_k_idx = 0;
+            }
 
             // For SM90 only
             // NOTES: we don't have to set `is_peer_cta_alive` for masked grouped GEMM, as it must be aligned
             is_peer_cta_alive = num_n_blocks % kNumMulticast == 0 or                  // Always aligned on N (constant bypass)
                                 num_m_blocks % kNumMulticast == 0 or                  // Always aligned on M (constant bypass)
-                                (next_block_idx ^ 1) < num_blocks;                    // Peer CTA in bound
-            get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
+                                (mn_block_idx ^ 1) < num_mn_blocks;                   // Peer CTA in bound
+            get_swizzled_block_idx(mn_block_idx, m_block_idx, n_block_idx);
         }
         return true;
     }

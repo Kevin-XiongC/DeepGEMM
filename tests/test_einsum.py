@@ -13,6 +13,22 @@ from deep_gemm.utils.math import (
 )
 
 
+def assert_bf16_einsum_close(z, ref_z, fp32_ref_fn) -> None:
+    # For BF16-in / BF16-out einsums only. SM120: DeepGEMM and the reference differ only in
+    # FP32 accumulation order -- both equally accurate against an FP64 reduction -- which puts
+    # the BF16 comparison a few ULPs past 1e-10. Relax the like-for-like check on arch 12 and
+    # pin correctness to FP32 truth instead. `fp32_ref_fn` is a thunk so the extra FP32 einsum
+    # is never run on other arches.
+    #
+    # Ported from nv_dev, which applies it at exactly these two call sites. It is NOT used
+    # where both sides are already FP32 -- see `test_bhd_bhr_hdr`.
+    if get_arch_major() != 12:
+        assert calc_diff(z, ref_z) < 1e-10
+        return
+    assert calc_diff(z, ref_z) < 1e-7
+    assert calc_diff(z, fp32_ref_fn()) < 1e-5
+
+
 def test_bmk_bnk_mn() -> None:
     print('Testing "bmk, bnk -> mn":')
     for s in (129, 4096, 8192):
@@ -50,7 +66,8 @@ def test_bhr_hdr_bhd():
                 deep_gemm.use_deterministic_algorithms(not use_cublaslt)
                 z = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
                 deep_gemm.einsum('bhr,hdr->bhd', x, y, z)
-                assert calc_diff(z, ref_z) < 1e-10
+                assert_bf16_einsum_close(z, ref_z,
+                                         lambda: torch.einsum('bhr,hdr->bhd', x.float(), y.float()))
                 kernel_name = 'nvjet' if use_cublaslt else 'gemm'
                 times.append(bench_kineto(lambda: deep_gemm.einsum('bhr,hdr->bhd', x, y, z), kernel_name, suppress_kineto_output=True))
             t, t_cublaslt = times
@@ -76,7 +93,8 @@ def test_bhd_hdr_bhr():
                 deep_gemm.use_deterministic_algorithms(not use_cublaslt)
                 z = torch.empty((b, h, r), device='cuda', dtype=torch.bfloat16)
                 deep_gemm.einsum('bhd,hdr->bhr', x, y, z)
-                assert calc_diff(z, ref_z) < 1e-10
+                assert_bf16_einsum_close(z, ref_z,
+                                         lambda: torch.einsum('bhd,hdr->bhr', x.float(), y.float()))
                 kernel_name = 'nvjet' if use_cublaslt else 'gemm'
                 times.append(bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z), kernel_name, suppress_kineto_output=True))
 
@@ -100,6 +118,11 @@ def test_bhd_bhr_hdr():
 
             z = z_0.clone()
             deep_gemm.einsum('bhd,bhr->hdr', x, y, z, z)
+            # NOT relaxed on arch 12: `z` and `ref_z` are both FP32 here (`ref_z` is
+            # `z_0 + einsum(x.float(), y.float())`, the FP32 truth), so the BF16
+            # accumulation-order argument behind `assert_bf16_einsum_close` does not apply.
+            # nv_dev has no counterpart for this test at all. Leave it strict; if SM120
+            # actually needs slack here, that is a finding, not a tolerance to pre-loosen.
             assert calc_diff(z, ref_z) < 1e-10
 
             t = bench_kineto(lambda: deep_gemm.einsum('bhd,bhr->hdr', x, y, z, z), 'nvjet', suppress_kineto_output=True)
