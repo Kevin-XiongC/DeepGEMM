@@ -619,6 +619,51 @@ def make_sparse_kv_block_indices(context_lens: List[int], request_indices: List[
     return torch.tensor(indices, device='cuda', dtype=torch.int32), num_blocks_per_q
 
 
+@test_filter(lambda: get_arch_major() == 9)
+def test_paged_mqa_logits_zero_context():
+    # A zero context length gives a request no KV work at all. `test_paged_mqa_logits`
+    # never generates one (context lens are drawn around a positive average), so the
+    # scheduler's empty-range handling needs its own case: with every length zero the
+    # binary search in `sm90_paged_mqa_logits_metadata` runs off the end of the batch,
+    # and reading `prefix_sum[batch_size]` is out of bounds of a shared buffer sized
+    # to exactly `align(batch_size, 32)` ints.
+    print('Testing Paged MQA Logits (zero context lengths):')
+    num_sms = deep_gemm.get_num_sms()
+
+    for block_kv in (32, 64):
+        for next_n in (1, 2, 4):
+            # SM90 next_n=4 schedules one item per two-CTA cluster, not per SM.
+            num_slots = num_sms // (2 if next_n == 4 else 1)
+            # batch_size == align(batch_size, 32) puts `prefix_sum[batch_size]` exactly
+            # one element past the end of the kernel's shared memory allocation.
+            for batch_size in (32, 1024):
+                # SM90 passes num_next_n_atoms=1, so the one-past-the-end q atom
+                # index the kernel writes for an empty range is just `batch_size`.
+                sentinel = batch_size
+                case = f'block_kv={block_kv}, next_n={next_n}, batch_size={batch_size}'
+
+                # All requests empty: every slot must be the one-past-the-end sentinel.
+                context_lens = torch.zeros((batch_size, next_n), device='cuda', dtype=torch.int)
+                metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens=context_lens, block_kv=block_kv, num_sms=num_slots)
+                torch.cuda.synchronize()
+                assert metadata.size(0) == num_slots + 1, case
+                assert (metadata[:, 0] == sentinel).all(), f'{case}: {metadata[:, 0].unique().tolist()}'
+                assert (metadata[:, 1] == 0).all(), f'{case}: {metadata[:, 1].unique().tolist()}'
+
+                # Empty requests interleaved with non-empty ones: scheduled q atoms must
+                # stay addressable, and the trailing slot must still be the sentinel.
+                context_lens = torch.zeros((batch_size, next_n), device='cuda', dtype=torch.int)
+                context_lens[::2] = 512
+                metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    context_lens=context_lens, block_kv=block_kv, num_sms=num_slots)
+                torch.cuda.synchronize()
+                q_atom_idx = metadata[:, 0]
+                assert (q_atom_idx <= sentinel).all(), f'{case}: {q_atom_idx.max().item()} > {sentinel}'
+                assert q_atom_idx[-1].item() == sentinel, f'{case}: {q_atom_idx[-1].item()}'
+    print(' > Passed\n')
+
+
 @test_filter(lambda: get_arch_major() == 10)
 def test_sparse_mqa_logits() -> None:
     num_heads, head_dim = 32, 128
@@ -862,4 +907,5 @@ if __name__ == '__main__':
     test_gemm_skip_head_mid()
     test_mqa_logits()
     test_paged_mqa_logits()
+    test_paged_mqa_logits_zero_context()
     test_sparse_mqa_logits()
