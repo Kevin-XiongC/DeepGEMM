@@ -576,6 +576,7 @@ def test_paged_mqa_logits():
               f'{total_bytes / t / 1e9:4.0f} GB/s, {relu_per_sm_cycle:4.1f} relu/cyc/SM')
 
         del metadata_kwargs, kernel_kwargs, logits, ref_neginf_mask, positions
+        del simulated_logits, self_mask, masked_logits, logits_again, logits_masked, ref_masked, simulated_masked
         del q_in, q_simulated, kv_in, kv_simulated, weights, kernel_weights, context_lens, context_lens_nextn, block_table
         if is_mxfp4 or is_mxfp8:
             del q_q
