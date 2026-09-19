@@ -192,7 +192,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
     constexpr uint32_t kRoutedPackFactor = kIsNVFP4 ? 2 : 1;
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
-    constexpr uint32_t L1_OUT_BLOCK_BYTES = L1_OUT_BLOCK_N / kRoutedPackFactor;
+    constexpr uint32_t L1_OUT_SMEM_STRIDE = kIsNVFP4 ? BLOCK_N / 4 : L1_OUT_BLOCK_N;
     constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M / 2; // float2
     constexpr uint32_t kRoutedABytes = LOAD_BLOCK_M * BLOCK_K / kRoutedPackFactor;
     constexpr uint32_t kRoutedBBytes = LOAD_BLOCK_N * BLOCK_K / kRoutedPackFactor;
@@ -205,7 +205,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
         alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
         union {
-            alignas(kSharedMemoryAlignment) uint8_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
+            alignas(kSharedMemoryAlignment) uint8_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_SMEM_STRIDE];
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
         } smem_d;
         // Shared FP8 and routed FP4 use different physical byte counts.  Keep
@@ -1226,11 +1226,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
 
                         // Apply SwiGLU: gate * sigmoid(alpha * gate) * (up + beta)
-                        auto fp32_values = reinterpret_cast<float2*>(raw_values);
+                        auto fp32_values = reinterpret_cast<float*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
-                            auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
-                            auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + 1]);
+                            auto bf16_gate = __float22bfloat162_rn(make_float2(
+                                fp32_values[k * 4 + 0], fp32_values[k * 4 + 1]));
+                            auto bf16_up = __float22bfloat162_rn(make_float2(
+                                fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
                             bf16_gate = __hmul2(bf16_gate, __float22bfloat162_rn(make_float2(l1_alpha.x, l1_alpha.x)));
                             bf16_up = __hmul2(bf16_up, __float22bfloat162_rn(make_float2(l1_alpha.y, l1_alpha.y)));
 
@@ -1323,16 +1325,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 make_float4(upper.x, upper.y, lower.x, lower.y)).__x;
                         }
 
-                        // STSM
-                        uint32_t row = lane_idx;
-                        uint32_t col = warp_idx_in_wg;
-                        const uint32_t l1_out_block_bytes = task_info.is_shared() ? L1_OUT_BLOCK_N : L1_OUT_BLOCK_BYTES;
-                        const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx])
-                            + i * ATOM_M * l1_out_block_bytes
-                            + row * l1_out_block_bytes
-                            // Match the physical swizzle width of the routed output.
-                            + (col ^ (row / 2)) * kNumBankGroupBytes;
-                        ptx::SM100_U8x4_STSM_T<uint32_t>::copy(quantized_values, smem_ptr);
+                        const uint32_t col = warp_idx_in_wg;
+                        const uint32_t l1_out_smem_stride = task_info.is_shared() ? L1_OUT_BLOCK_N : L1_OUT_SMEM_STRIDE;
+                        auto l1_smem_base = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx])
+                            + i * ATOM_M * l1_out_smem_stride;
+                        if (kIsNVFP4 and not task_info.is_shared()) {
+                            const uint32_t group = lane_idx % 4;
+                            const uint32_t q = lane_idx / 4;
+                            const uint32_t partner_values = __shfl_sync(0xffffffffu, quantized_values, lane_idx ^ 4);
+                            if ((q & 1) == 0) {
+                                const uint32_t segment = col ^ (group & 2);
+                                const uint32_t segment_base = segment * 8;
+                                const uint32_t row_base = group * 2 * l1_out_smem_stride;
+                                const uint32_t packed_upper = ((quantized_values >> 0) & 0xfu) |
+                                                               (((partner_values >> 0) & 0xfu) << 4);
+                                const uint32_t packed_lower = ((quantized_values >> 16) & 0xfu) |
+                                                               (((partner_values >> 16) & 0xfu) << 4);
+                                const uint32_t packed_upper_next = ((quantized_values >> 8) & 0xfu) |
+                                                                    (((partner_values >> 8) & 0xfu) << 4);
+                                const uint32_t packed_lower_next = ((quantized_values >> 24) & 0xfu) |
+                                                                    (((partner_values >> 24) & 0xfu) << 4);
+                                l1_smem_base[row_base + segment_base + q / 2] = static_cast<uint8_t>(packed_upper);
+                                l1_smem_base[row_base + segment_base + 4 + q / 2] = static_cast<uint8_t>(packed_lower);
+                                l1_smem_base[row_base + l1_out_smem_stride + segment_base + q / 2] = static_cast<uint8_t>(packed_upper_next);
+                                l1_smem_base[row_base + l1_out_smem_stride + segment_base + 4 + q / 2] = static_cast<uint8_t>(packed_lower_next);
+                            }
+                        } else {
+                            const uint32_t row = lane_idx;
+                            const auto smem_ptr = l1_smem_base
+                                + row * l1_out_smem_stride
+                                + (col ^ (row / 2)) * kNumBankGroupBytes;
+                            ptx::SM100_U8x4_STSM_T<uint32_t>::copy(quantized_values, smem_ptr);
+                        }
 
                         // Store SF to `buffer.l2_sf_buffer` as UE8M0 (MN-major layout)
                         // Only one warp per pair writes (both hold the same SF after cross-warp reduce)

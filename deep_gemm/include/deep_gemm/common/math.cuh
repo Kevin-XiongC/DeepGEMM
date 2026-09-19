@@ -122,13 +122,10 @@ CUTLASS_DEVICE uint32_t quantize_fp4_e2m1x4(const float2& upper, const float2& l
     };
     const auto upper_scaled = __fmul2_rn(upper, sf_inv);
     const auto lower_scaled = __fmul2_rn(lower, sf_inv);
-    const auto pack = [&](const uint32_t lower_code, const uint32_t upper_code) {
-        return lower_code | (upper_code << 4);
-    };
-    const uint32_t upper_packed = pack(quantize(upper_scaled.x), quantize(upper_scaled.y));
-    const uint32_t lower_packed = pack(quantize(lower_scaled.x), quantize(lower_scaled.y));
-    return upper_packed | (upper_packed << 8) |
-           (lower_packed << 16) | (lower_packed << 24);
+    return quantize(upper_scaled.x) |
+           (quantize(upper_scaled.y) << 8) |
+           (quantize(lower_scaled.x) << 16) |
+           (quantize(lower_scaled.y) << 24);
 }
 
 // Select a power-of-two UE8M0 SF mapping `amax` into the finite range of `quant_dtype_t`:

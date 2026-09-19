@@ -96,7 +96,7 @@ ssh ... 'kubectl -n ruizi-k3pd exec k3-dev-56db6fdb4c-zfmkf -- cat /root/DeepGEM
 ### 2.4.2 本轮修复的两个致命 kernel bug(2026-09-19)
 
 - **K=96 descriptor 越界**:NVFP4 routed MMA 改为每个 192-K block 发射 3 个 K=64 MMA;恢复默认 `k_size=0` descriptor,并将每条 MMA 的 SF 起点改为 `k * 4`。这样每条指令都落在 128-element swizzled descriptor block 内,不再从 K=96 跨越到下一 descriptor block。
-- **L1 packed-FP4 存储链路**:L1 输出的 TMA SMEM tile 从 FP8 的 `BLOCK_N / 2` 和 64B swizzle 改为 NVFP4 的物理 `BLOCK_N / 4` 和 32B swizzle;epilogue STSM 地址按 packed byte stride 计算,shared expert 仍保持 FP8 的 64B stride。TMA global 坐标仍按逻辑 FP4 元素计数。
+- **L1 packed-FP4 存储链路**:不能直接复用 `SM100_U8x4_STSM_T` 写 NVFP4 packed tile;该路径每个 32-bit source 只有 4 个独立 FP4 code,其余 nibble 会重复。当前 routed NVFP4 保持 `.b4x16` packed TMA descriptor 和 32B swizzle,由每个偶数 `q` lane 从 partner lane 取 4 个 code,合成 4 个 packed byte 后按 swizzled SMEM 坐标直接写入;shared FP8 仍走原有 STSM 和 64B stride。TMA global 坐标仍按逻辑 FP4 元素计数。
 - **POD 验证**:重编并安装 `deep_gemm-2.8.0+local` 后,4-rank、`hidden=4096`、`intermediate_hidden=2048`、`topk=1` 的 routed `fp4xfp4` 在 `tokens=32/64/128` 均通过;`num_shared_experts=1` 的 routed+shared 用例也通过。旧 `fp8xfp4` 回归在初始化后无输出并被中止,不作为本轮回归结论。
 
 ### 2.5 已解除的 POD 阻塞 / 当前剩余工作
@@ -117,7 +117,7 @@ python3 -u test_mega_moe.py --num-processes 4 --num-experts 256 --activation swi
 
 - [ ] fp8xfp4 / fp8xfp8 / bf16xbf16 基线全绿(回归;本轮 `fp8xfp4 + shared` 初始化后长时间无输出,已中止)
 - [x] routed NVFP4 + shared FP8 的独立 quantized-operand reference 通过(`tokens=32/64/128`, `max_abs=0`)
-- [x] 修复 K=96 MMA descriptor 越界和 L1 packed-FP4 TMA/SMEM 存储链路
+- [x] 修复 K=96 MMA descriptor 越界和 L1 packed-FP4 TMA/SMEM 存储链路(含 lane-pair packed store)
 - [x] 用 GLM-5.3-Flash-NVFP4 真实 expert 权重(hidden=4096, inter=2048)完成独立 reference 对比；尚不代表 vLLM loader/E2E 已接通
 - [x] POD 上完成 `fp4xfp4` 4-rank performance smoke(`~2.6 PFLOPS`, `~2.9 ms`)
 - [ ] pod 侧改动尽快 `git commit`(pod 重建 /root 会丢;或 `git diff > /data/备份.patch`)
