@@ -5,6 +5,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 namespace deep_gemm::layout {
@@ -350,8 +351,7 @@ struct MegaMoEBuffer {
            input_topk_idx_buffer,
            input_topk_weights_buffer;
 
-    // Routed expert ring buffers
-    // NOTE: shared L1 tokens reuse `input_token_buffer`.
+    // Shared expert buffers
     Buffer shared_l1_token_buffer, shared_l1_sf_buffer,
            shared_l2_token_buffer, shared_l2_sf_buffer;
 
@@ -374,7 +374,9 @@ struct MegaMoEBuffer {
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
-                  const uint32_t& num_shared_experts = 0) {
+                  const uint32_t& num_shared_experts = 0,
+                  const bool& packed_fp4 = false,
+                  const uint32_t& gran_k = 32) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -382,15 +384,19 @@ struct MegaMoEBuffer {
         // Shared
         const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
         const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
+        const bool use_separate_shared_input = packed_fp4 and num_shared_experts > 0;
 
         // Layouts
         const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
+        const uint32_t num_mma_pack_factor = packed_fp4 ? 2 : 1;
+        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes / num_mma_pack_factor);
+        const auto shared_input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
         const auto bf16_token_layout = layout::Data(hidden * 2);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
+        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes / num_mma_pack_factor);
         const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0, false);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0, false);
+        const auto input_sf_layout = layout::Data(with_sf ? hidden / gran_k : 0, false);
+        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / gran_k : 0, false);
+        const auto shared_input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0, false);
         const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0, false);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
@@ -410,14 +416,19 @@ struct MegaMoEBuffer {
             input_topk_weights_layout, 1, num_max_tokens_per_rank,
             input_topk_idx_buffer.get_end_ptr());
 
-        // Shared expert buffers
-        shared_l1_token_buffer = input_token_buffer;
+        // Shared expert buffers.  NVFP4 routed dispatch is W4A4, while shared
+        // experts retain the existing FP8/UE8M0 path.
+        shared_l1_token_buffer = use_separate_shared_input ? Buffer(
+            shared_input_token_layout, 1, num_max_tokens_per_rank,
+            input_topk_weights_buffer.get_end_ptr()) : input_token_buffer;
         shared_l1_sf_buffer = Buffer(
-            input_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
-            input_topk_weights_buffer.get_end_ptr());
+            use_separate_shared_input ? shared_input_sf_layout : input_sf_layout,
+            1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
+            use_separate_shared_input ? shared_l1_token_buffer.get_end_ptr() : input_topk_weights_buffer.get_end_ptr());
         shared_l2_token_buffer = Buffer(
             shared_intermediate_token_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
-            with_sf ? shared_l1_sf_buffer.get_end_ptr() : input_topk_weights_buffer.get_end_ptr());
+            with_sf ? shared_l1_sf_buffer.get_end_ptr() :
+                      (use_separate_shared_input ? shared_l1_token_buffer.get_end_ptr() : input_topk_weights_buffer.get_end_ptr()));
         shared_l2_sf_buffer = Buffer(
             shared_intermediate_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
             shared_l2_token_buffer.get_end_ptr());

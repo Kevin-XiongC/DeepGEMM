@@ -7,7 +7,7 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 
 import deep_gemm
-from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8, per_token_cast_to_nvfp4
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
 
@@ -57,6 +57,11 @@ def _cast_fp8_for_mega_moe(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
         (mn, packed_sf_k), (1, align(mn, 4)), dtype=x_sf.dtype, device=x_sf.device)
     x_sf_tma.copy_(x_sf)
     return x_fp8, x_sf, x_sf_tma
+
+
+def _pack_nvfp4_sf(sf: torch.Tensor) -> torch.Tensor:
+    assert sf.dtype == torch.float8_e4m3fn and sf.dim() == 2 and sf.size(1) % 4 == 0
+    return sf.view(torch.uint8).view(sf.size(0), -1, 4).contiguous().view(torch.int32).squeeze(-1)
 
 
 def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
@@ -111,6 +116,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
         return w, w_sf
 
+    def _cast_weights_to_nvfp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
+        w_sf = torch.empty((num_groups, n, k // 16), device='cuda', dtype=torch.float8_e4m3fn)
+        for i in range(num_groups):
+            w[i], w_sf[i], _ = per_token_cast_to_nvfp4(bf16_weights[i], gran_k=16)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 16), num_groups)
+        return w, w_sf
+
     def _cast_weights_to_fp8(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k), device='cuda', dtype=torch.float8_e4m3fn)
@@ -154,16 +168,23 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_l1_weights = shared_l2_weights = None
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs and weights with per-32 UE8M0 SF
+            # FP8/NVFP4 path: keep shared experts on FP8/UE8M0.
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
-            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
-            x = (x_fp8, x_sf)
+            x_fp8, x_sf_fp8, x_sf_tma = _cast_fp8_for_mega_moe(x)
+            if args.mma_type == 'fp4xfp4':
+                x_fp4, x_sf_e4m3, _ = per_token_cast_to_nvfp4(x, gran_k=16)
+                x = (x_fp4, _pack_nvfp4_sf(x_sf_e4m3))
+            else:
+                x = (x_fp8, x_sf_fp8)
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
-                shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
-            cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
+                shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf_tma, block_m, buffer.shared_l1_acts_sf.shape[0])
+            cast_weights = (
+                _cast_weights_to_nvfp4 if args.mma_type == 'fp4xfp4' else
+                _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else
+                _cast_weights_to_fp4)
             l1_weights = cast_weights(l1_weights)
             l2_weights = cast_weights(l2_weights)
             if num_shared_experts > 0:
@@ -189,6 +210,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             buffer.x[:num_tokens].copy_(x[0])
             buffer.x_sf[:num_tokens].copy_(x[1])
             if num_shared_experts > 0:
+                buffer.shared_l1_acts[:num_tokens].copy_(shared_x[0])
                 _copy_fp8_sf(buffer.shared_l1_acts_sf, shared_l1_x_sf, num_tokens)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
@@ -206,7 +228,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
             activation_alpha=args.activation_alpha,
-            activation_beta=args.activation_beta)
+            activation_beta=args.activation_beta,
+            recipe=(1, 1, 16 if args.mma_type == 'fp4xfp4' else 32))
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -243,6 +266,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    if args.mma_type == 'fp4xfp4':
+        deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = None, None, None, False
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
@@ -456,7 +481,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp4xfp4', 'fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

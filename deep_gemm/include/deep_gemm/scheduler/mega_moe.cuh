@@ -159,7 +159,11 @@ struct L2KBlockDependency {
 
     // Re-read the mask only when the K block is not fed yet
     CUTLASS_DEVICE void wait(const uint32_t& k_block_idx) {
-        const auto k_block_mask = ((1ull << kNumL1BlockNsPerL2KBlock) - 1) << (k_block_idx * kNumL1BlockNsPerL2KBlock);
+        const auto l1_block_ns_per_l2_k_block = BLOCK_K / (BLOCK_N / 2);
+        const auto first_l1_block_n = k_block_idx * l1_block_ns_per_l2_k_block;
+        const auto num_l1_block_ns = l1_block_ns_per_l2_k_block < kNumL1BlockNs - first_l1_block_n ?
+            l1_block_ns_per_l2_k_block : kNumL1BlockNs - first_l1_block_n;
+        const auto k_block_mask = ((1ull << num_l1_block_ns) - 1) << first_l1_block_n;
         while (pending_mask & k_block_mask)
             pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
     }
@@ -172,6 +176,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kNumRingBlocks,
           uint32_t kNumSharedExperts = 0,
+          bool kAllowPartialK = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -187,12 +192,12 @@ struct MegaMoEScheduler {
 
     DG_STATIC_ASSERT(L1_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shape");
-    DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
-    DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
+    DG_STATIC_ASSERT(kAllowPartialK or L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
+    DG_STATIC_ASSERT(kAllowPartialK or L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(SHARED_L1_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shared shape");
     DG_STATIC_ASSERT(SHARED_L2_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shared shape");
-    DG_STATIC_ASSERT(SHARED_L1_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
-    DG_STATIC_ASSERT(SHARED_L2_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
+    DG_STATIC_ASSERT(kAllowPartialK or SHARED_L1_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
+    DG_STATIC_ASSERT(kAllowPartialK or SHARED_L2_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
 
     // NOTES: N block counts must be even so that 2 adjacent CTAs in a cluster
     // always land on the same m_block_idx with n_block_idx differing by 1

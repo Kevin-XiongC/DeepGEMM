@@ -8,6 +8,28 @@
 
 namespace deep_gemm::layout {
 
+static torch::Tensor get_mn_major_tma_aligned_packed_e4m3_tensor(const torch::Tensor& sf) {
+    const auto sf_reshaped = sf.dim() == 2 ? sf.unsqueeze(0) : sf;
+    DG_HOST_ASSERT(sf_reshaped.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(sf_reshaped.is_contiguous());
+    const auto num_groups = static_cast<int>(sf_reshaped.size(0));
+    const auto mn = static_cast<int>(sf_reshaped.size(1));
+    const auto sf_k = static_cast<int>(sf_reshaped.size(2));
+    const auto aligned_mn = get_tma_aligned_size(mn, sizeof(int32_t));
+    const auto aligned_sf_k = align(sf_k, 4);
+    auto padded = torch::zeros(
+        {num_groups, aligned_mn, aligned_sf_k},
+        torch::TensorOptions().device(sf.device()).dtype(torch::kUInt8));
+    padded.slice(1, 0, mn).slice(2, 0, sf_k).copy_(sf_reshaped.view(torch::kUInt8));
+    const auto packed = padded.view(torch::kInt32).view({num_groups, aligned_mn, aligned_sf_k / 4});
+    auto out = torch::empty_strided(
+        {num_groups, mn, aligned_sf_k / 4},
+        {static_cast<int64_t>(aligned_mn) * (aligned_sf_k / 4), 1, aligned_mn},
+        torch::TensorOptions().device(sf.device()).dtype(torch::kInt));
+    out.copy_(packed.slice(1, 0, mn));
+    return sf.dim() == 2 ? out.squeeze(0) : out;
+}
+
 static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
                                                        const int& mn, const int& k,
                                                        const std::variant<std::tuple<int, int, int>,
@@ -33,6 +55,10 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
 
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
+
+    if (sf.scalar_type() == torch::kFloat8_e4m3fn and gran_mn == 1 and gran_k == 16 and
+        (arch_major == 10 or arch_major == 12))
+        return get_mn_major_tma_aligned_packed_e4m3_tensor(sf);
 
     // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
     if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))

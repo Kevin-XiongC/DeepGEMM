@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Optional, Tuple, Union
 
 
 def ceil_div(x: int, y: int) -> int:
@@ -123,6 +123,36 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
             sf = torch.nn.functional.pad(sf, (0, pad), value=1.0)
         return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf)
     return packed[:, :n // 2].contiguous(), sf
+
+
+def per_token_cast_to_nvfp4(x: torch.Tensor, gran_k: int = 16,
+                            global_scale: Optional[Union[float, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and gran_k == 16
+    m, n = x.shape
+    padded_n = align(n, gran_k)
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, gran_k)
+    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
+    if global_scale is None:
+        global_scale = torch.ones((), dtype=torch.float32, device=x.device)
+    elif not isinstance(global_scale, torch.Tensor):
+        global_scale = torch.tensor(global_scale, dtype=torch.float32, device=x.device)
+    else:
+        global_scale = global_scale.to(device=x.device, dtype=torch.float32)
+    assert global_scale.numel() == 1 and torch.isfinite(global_scale).item() and global_scale.item() > 0
+    sf = (x_amax / 6.0 / global_scale).to(torch.float8_e4m3fn)
+    sf_value = sf.float().clamp_min(1e-4)
+    codes = _quantize_to_fp4_e2m1(
+        x_view / (sf_value * global_scale).unsqueeze(2)
+    ).view(m, padded_n)
+    codes2 = codes.view(m, padded_n // 2, 2)
+    packed = ((codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)).to(torch.int8)
+    return (
+        packed[:, :n // 2].contiguous(),
+        sf[:, :ceil_div(n, gran_k)].contiguous(),
+        global_scale,
+    )
 
 
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
