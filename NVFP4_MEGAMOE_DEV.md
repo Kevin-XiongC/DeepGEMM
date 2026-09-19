@@ -1,7 +1,7 @@
 # DeepGEMM Mega MoE 原生 NVFP4(W4A4)支持 — 开发交接文档
 
 > 目标:为 vllm-project/DeepGEMM fork 的 Mega MoE 融合算子完成 **NVFP4(e2m1 + e4m3 SF@16 + per-tensor fp32 global scale)** 支持并验证通过。算子级验证用 pod 内真实 checkpoint `/data/models/RedHatAI/GLM-5.3-Flash-NVFP4` 的 expert 权重。
-> **重要状态更新(2026-09-19):NVFP4 实现已完成 POD 编译和 4-rank handoff 验收;当前已完成算子级合成数据与真实 checkpoint expert 的独立 correctness,尚未完成 vLLM loader/完整模型端到端接线。**
+> **重要状态更新(2026-09-19):NVFP4 实现已完成 POD 编译和 4-rank handoff 验收;本轮又修复了 K=96 MMA descriptor 越界和 L1 packed-FP4 TMA/SMEM 存储宽度错误,并在 POD 完成 routed/shared 合成 correctness;尚未完成 vLLM loader/完整模型端到端接线。**
 
 ---
 
@@ -93,6 +93,12 @@ ssh ... 'kubectl -n ruizi-k3pd exec k3-dev-56db6fdb4c-zfmkf -- cat /root/DeepGEM
 - 已完成真实 checkpoint 的独立 quantized-operand correctness：`/data/models/RedHatAI/GLM-5.3-Flash-NVFP4` layer 3、expert 0–3、4 ranks、`hidden=4096/intermediate=2048`、topk=1，在 `tokens=32/64/128` 下均完成 reference 对比；各 rank `max_abs` 约 `6.1–8.1`，mean absolute error 约 `1.05–1.15`。`weight_global_scale` 按 divisor 语义以 `1 / weight_global_scale` 传入 `l1/l2 alpha`；`input_global_scale` 尚未接入动态激活量化。
 - 尚未完成 vLLM loader 接线、完整 45-layer 推理，以及 shared expert 的真实 checkpoint 端到端校验。
 
+### 2.4.2 本轮修复的两个致命 kernel bug(2026-09-19)
+
+- **K=96 descriptor 越界**:NVFP4 routed MMA 改为每个 192-K block 发射 3 个 K=64 MMA;恢复默认 `k_size=0` descriptor,并将每条 MMA 的 SF 起点改为 `k * 4`。这样每条指令都落在 128-element swizzled descriptor block 内,不再从 K=96 跨越到下一 descriptor block。
+- **L1 packed-FP4 存储链路**:L1 输出的 TMA SMEM tile 从 FP8 的 `BLOCK_N / 2` 和 64B swizzle 改为 NVFP4 的物理 `BLOCK_N / 4` 和 32B swizzle;epilogue STSM 地址按 packed byte stride 计算,shared expert 仍保持 FP8 的 64B stride。TMA global 坐标仍按逻辑 FP4 元素计数。
+- **POD 验证**:重编并安装 `deep_gemm-2.8.0+local` 后,4-rank、`hidden=4096`、`intermediate_hidden=2048`、`topk=1` 的 routed `fp4xfp4` 在 `tokens=32/64/128` 均通过;`num_shared_experts=1` 的 routed+shared 用例也通过。旧 `fp8xfp4` 回归在初始化后无输出并被中止,不作为本轮回归结论。
+
 ### 2.5 已解除的 POD 阻塞 / 当前剩余工作
 
 - 历史现象：外部 VLLM persistent worker 占满每卡显存时，persistent mega kernel 会因无法同时驻留而长时间停在 grid/barrier；该外部进程已由用户清理，当前 handoff 命令已恢复正常。
@@ -109,8 +115,9 @@ python3 -u test_mega_moe.py --num-processes 4 --num-experts 256 --activation swi
 python3 -u test_mega_moe.py --num-processes 4 --num-experts 256 --activation swiglu --mma-type fp4xfp4  # NVFP4
 ```
 
-- [ ] fp8xfp4 / fp8xfp8 / bf16xbf16 基线全绿(回归)
+- [ ] fp8xfp4 / fp8xfp8 / bf16xbf16 基线全绿(回归;本轮 `fp8xfp4 + shared` 初始化后长时间无输出,已中止)
 - [x] routed NVFP4 + shared FP8 的独立 quantized-operand reference 通过(`tokens=32/64/128`, `max_abs=0`)
+- [x] 修复 K=96 MMA descriptor 越界和 L1 packed-FP4 TMA/SMEM 存储链路
 - [x] 用 GLM-5.3-Flash-NVFP4 真实 expert 权重(hidden=4096, inter=2048)完成独立 reference 对比；尚不代表 vLLM loader/E2E 已接通
 - [x] POD 上完成 `fp4xfp4` 4-rank performance smoke(`~2.6 PFLOPS`, `~2.9 ms`)
 - [ ] pod 侧改动尽快 `git commit`(pod 重建 /root 会丢;或 `git diff > /data/备份.patch`)

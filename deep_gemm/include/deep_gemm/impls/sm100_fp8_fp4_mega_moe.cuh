@@ -161,7 +161,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
     constexpr uint32_t UMMA_BLOCK_K = kIsNVFP4 ? 192 : 128;
-    constexpr uint32_t UMMA_K = kIsNVFP4 ? 96 : 32;
+    constexpr uint32_t UMMA_K = kIsNVFP4 ? 64 : 32;
     constexpr uint32_t SHARED_UMMA_BLOCK_K = 128;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
@@ -190,9 +190,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Shared memory sizes
     // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
-    constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
-    constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M / 2; // float2
     constexpr uint32_t kRoutedPackFactor = kIsNVFP4 ? 2 : 1;
+    constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
+    constexpr uint32_t L1_OUT_BLOCK_BYTES = L1_OUT_BLOCK_N / kRoutedPackFactor;
+    constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M / 2; // float2
     constexpr uint32_t kRoutedABytes = LOAD_BLOCK_M * BLOCK_K / kRoutedPackFactor;
     constexpr uint32_t kRoutedBBytes = LOAD_BLOCK_N * BLOCK_K / kRoutedPackFactor;
     constexpr uint32_t kSharedABytes = LOAD_BLOCK_M * BLOCK_K;
@@ -864,8 +865,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     UMMA_M, UMMA_N,
                     cute::UMMA::Major::K, cute::UMMA::Major::K
                 >();
-            if constexpr (kIsNVFP4)
-                routed_instr_desc.k_size_ = 1;
             auto shared_instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                 shared_b_dtype_t, shared_a_dtype_t, float, cutlass::float_ue8m0_t,
                 UMMA_M, UMMA_N,
@@ -1060,7 +1059,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                             descriptor_k_block_idx * kRoutedDescriptorBlockK,
                                             descriptor_k_idx);
                                     const uint32_t sf_tmem_bank = umma_k_block_idx * kNumSFWordsPerUMMABlock * 4;
-                                    const uint32_t sf_idx = k * 6;
+                                    const uint32_t sf_idx = k * 4;
                                     const uint32_t sf_addr = (sf_idx / 4) * 4 + (sf_idx % 4) * (1u << 30);
                                     const uint32_t sfa_tmem_addr = kTmemStartColOfSFA + sf_tmem_bank + sf_addr;
                                     const uint32_t sfb_tmem_addr = kTmemStartColOfSFB + sf_tmem_bank + sf_addr;
@@ -1327,10 +1326,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // STSM
                         uint32_t row = lane_idx;
                         uint32_t col = warp_idx_in_wg;
+                        const uint32_t l1_out_block_bytes = task_info.is_shared() ? L1_OUT_BLOCK_N : L1_OUT_BLOCK_BYTES;
                         const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx])
-                            + i * ATOM_M * L1_OUT_BLOCK_N
-                            + row * L1_OUT_BLOCK_N
-                            // Use 64B swizzle for SwiGLU, so divided by 2
+                            + i * ATOM_M * l1_out_block_bytes
+                            + row * l1_out_block_bytes
+                            // Match the physical swizzle width of the routed output.
                             + (col ^ (row / 2)) * kNumBankGroupBytes;
                         ptx::SM100_U8x4_STSM_T<uint32_t>::copy(quantized_values, smem_ptr);
 

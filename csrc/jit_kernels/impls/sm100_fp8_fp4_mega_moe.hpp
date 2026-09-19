@@ -58,6 +58,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const int shared_gran_k = 32;
     const int shared_sf_smem_outer_dim = config.block_k / (shared_gran_k * 4);
+    const int l1_output_smem_dim = is_nvfp4 ? config.block_n / 4 : config.block_n / 2;
+    const int l1_output_swizzle_mode = is_nvfp4 ? config.swizzle_acts_mode / 4 : config.swizzle_acts_mode / 2;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_ring_tokens,
                                                      config.block_k, config.load_block_m,
@@ -79,13 +81,14 @@ static void sm100_fp8_fp4_mega_moe(
                                                         num_experts_per_rank, 0, 0, false,
                                                         sf_smem_outer_dim);
     // NOTES: L1 output and L2 activations are essentially the same tensor.
-    // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
-    // so the swizzle mode is also halved (128 -> 64).
+    // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile).
+    // Packed FP4 stores two output elements per byte, so its physical SMEM
+    // tile and swizzle are halved once more.
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_ring_tokens,
-                                                       config.block_n / 2, config.store_block_m,
+                                                       l1_output_smem_dim, config.store_block_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
-                                                       config.swizzle_acts_mode / 2, 0, false,
+                                                       l1_output_swizzle_mode, 0, false,
                                                        fp4_unpacked_smem);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
                                                      intermediate_hidden, config.num_ring_tokens,
