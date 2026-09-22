@@ -46,6 +46,8 @@ class SymmBuffer:
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        self.packed_fp4 = mma_type == 'fp4xfp4'
+        self.gran_k = 16 if self.packed_fp4 else 32
 
         # Allocate or reuse a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -185,7 +187,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
                      activation_alpha: float = 1.0,
-                     activation_beta: float = 0.0):
+                     activation_beta: float = 0.0,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None):
     _validate_activation(activation)
     _C.fp8_fp4_mega_moe(
         y,
@@ -196,6 +200,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
+        l1_alphas, l2_alphas,
         recipe,
         activation, activation_clamp,
         fast_math,

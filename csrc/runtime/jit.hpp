@@ -11,6 +11,19 @@ namespace deep_gemm {
 
 inline deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>> jit(nullptr);
 
+inline void set_nvfp4_compiler_options(deep_jit::cuda::CompilerOptions& options) {
+    const auto arch = jit->device.get_arch(false);
+    if (arch == "103a") {
+        options.arch = "103";
+        options.extra_nvcc_flags = {
+            "--gpu-architecture=compute_103a",
+            "--gpu-code=sm_103a",
+        };
+    } else {
+        options.arch = arch;
+    }
+}
+
 inline void init_jit(const std::string& library_root_path) {
     const auto library_root = std::filesystem::absolute(library_root_path);
     const auto include_dir = library_root / "include";
